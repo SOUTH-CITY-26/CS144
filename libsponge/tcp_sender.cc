@@ -10,7 +10,7 @@
 // automated checks run by `make check_lab3`.
 
 template <typename... Targs>
-void DUMMY_CODE(Targs &&.../* unused */) {}
+void DUMMY_CODE(Targs &&... /* unused */) {}
 
 using namespace std;
 
@@ -20,49 +20,48 @@ using namespace std;
 TCPSender::TCPSender(const size_t capacity, const uint16_t retx_timeout, const std::optional<WrappingInt32> fixed_isn)
     : _isn(fixed_isn.value_or(WrappingInt32{random_device()()}))
     , _initial_retransmission_timeout{retx_timeout}
-    , _stream(capacity)
+    , _stream(capacity) 
     , _retransmission_timeout(retx_timeout) {}
 
 uint64_t TCPSender::bytes_in_flight() const { return _bytes_in_flight; }
 
 void TCPSender::fill_window() {
-    // if `_sending_end` has been set, the sender shouldn't send any new bytes
-    if (_sending_ending) {
+    // 已发送FIN，不能再发送新字节
+    if (_fin_sent) {
         return;
     }
-    // if the window size is 0, it should act like the window size is 1
-    size_t sending_space = _ackno + (_window_size != 0 ? _window_size : 1) - next_seqno_absolute();
-    // have the sending space and not get to sending ending
-    while (sending_space > 0 && !_sending_ending) {
-        TCPSegment segment;
-        TCPHeader &header = segment.header();
-        if (next_seqno_absolute() == 0) {
+    // 如果窗口大小为0，发送空间为1
+    size_t sending_space = _ackno + (_window_size != 0 ? _window_size : 1) - _next_seqno;
+    // 有发送空间且未发送FIN
+    while (sending_space > 0 && !_fin_sent) {
+        TCPSegment seg;
+        TCPHeader &header = seg.header();
+        if (_next_seqno == 0) { // 发送第一个字节，设置SYN
             header.syn = true;
             --sending_space;
         }
-        header.seqno = next_seqno();
-        Buffer &buffer = segment.payload();
+        header.seqno = wrap(_next_seqno, _isn);
+        Buffer &buffer = seg.payload();
         buffer = stream_in().read(min(sending_space, TCPConfig::MAX_PAYLOAD_SIZE));
-        // don't add FIN if this would make the segment exceed the receiver's window
+        // 如果添加FIN会超过窗口大小，就不添加
         sending_space -= buffer.size();
         if (stream_in().eof() && sending_space > 0) {
             header.fin = true;
             --sending_space;
-            // set `_sending_ending` true, so that sender will never send any new bytes
-            _sending_ending = true;
+            _fin_sent = true;
         }
 
-        size_t len = segment.length_in_sequence_space();
+        size_t len = seg.length_in_sequence_space();
         if (len == 0) {
             return;
         }
 
-        segments_out().emplace(segment);
-        if (!_timer.started()) {
-            _timer.start();
+        segments_out().emplace(seg);
+        if (_timer_running == false) {
+            _timer = 0;
+            _timer_running = true;
         }
-        _outstanding_segments.emplace(segment);
-
+        _segments_outstanding.emplace(seg);
         _next_seqno += len;
         _bytes_in_flight += len;
     }
@@ -70,57 +69,66 @@ void TCPSender::fill_window() {
 
 //! \param ackno The remote receiver's ackno (acknowledgment number)
 //! \param window_size The remote receiver's advertised window size
+//! \returns `false` if the ackno appears invalid (acknowledges something the TCPSender hasn't sent yet)
 bool TCPSender::ack_received(const WrappingInt32 ackno, const uint16_t window_size) {
-    _ackno = unwrap(ackno, _isn, next_seqno_absolute());
-    // impossible ackno (beyond next seqno) should be ignored
-    if (_ackno > next_seqno_absolute()) {
-        return false;
+    _ackno = unwrap(ackno, _isn, _next_seqno);
+    if (_ackno > _next_seqno) {
+        return false;           // 还未发送到这个ackno
     }
     _window_size = window_size;
 
-    // the flag indicating that if new data has been acknowledged
-    bool has_new = false;
-    while (!_outstanding_segments.empty()) {
-        TCPSegment segment = _outstanding_segments.front();
-        size_t len = segment.length_in_sequence_space();
-        uint64_t seqno = unwrap(segment.header().seqno, _isn, next_seqno_absolute());
-        // the segment is not fully acknowledged, should stop
+    bool has_new = false;       // 标识是否有新的ack被接收
+    while (!_segments_outstanding.empty()) {
+        TCPSegment seg = _segments_outstanding.front();
+        size_t len = seg.length_in_sequence_space();
+        uint64_t seqno = unwrap(seg.header().seqno, _isn, _next_seqno);
+        // 当前报文还未被完全ack，不能从未确认队列中移除
         if (seqno + len > _ackno) {
             break;
         }
-        _outstanding_segments.pop();
+        _segments_outstanding.pop();
         _bytes_in_flight -= len;
         has_new = true;
     }
+    fill_window();
     if (has_new) {
         _retransmission_timeout = _initial_retransmission_timeout;
-        if (!_outstanding_segments.empty()) {
-            _timer.start();
+        if (!_segments_outstanding.empty()) {
+            _timer = 0;
+            _timer_running = true;
         } else {
-            _timer.stop();
+            _timer_running = false;
         }
-        _consecutive_retransmissions = 0;
+        _consec_retrans = 0;
     }
     return true;
 }
 
 //! \param[in] ms_since_last_tick the number of milliseconds since the last call to this method
 void TCPSender::tick(const size_t ms_since_last_tick) {
-    if (!_timer.expired(ms_since_last_tick, _retransmission_timeout)) {
+    if (!_timer_running) {
         return;
     }
-    segments_out().push(_outstanding_segments.front());
-    if (_window_size != 0) {
-        ++_consecutive_retransmissions;
-        _retransmission_timeout <<= 1;
+
+    _timer += ms_since_last_tick;
+
+    if (_timer >= _retransmission_timeout) {
+        segments_out().push(_segments_outstanding.front());
+
+        if (_window_size != 0) {
+            _consec_retrans++;
+            _retransmission_timeout *= 2;
+        }
+
+        _timer = 0;
+        _timer_running = true;
     }
-    _timer.start();
 }
 
-unsigned int TCPSender::consecutive_retransmissions() const { return _consecutive_retransmissions; }
+unsigned int TCPSender::consecutive_retransmissions() const { return _consec_retrans; }
 
 void TCPSender::send_empty_segment() {
-    TCPSegment segment;
-    segment.header().seqno = next_seqno();
-    segments_out().emplace(segment);
+    TCPSegment seg;
+    seg.header().seqno = wrap(_next_seqno, _isn);
+    segments_out().emplace(seg);
 }
