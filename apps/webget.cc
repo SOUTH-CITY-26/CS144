@@ -16,31 +16,30 @@ void get_URL(const string &host, const string &path) {
     // Then you'll need to print out everything the server sends back,
     // (not just one call to read() -- everything) until you reach
     // the "eof" (end of file).
-
+    
     const Address addr(host, "http");
     CS144TCPSocket tcpSocket;
-    tcpSocket.connect(addr);  // connect the HTTP server
+    tcpSocket.connect(addr);
 
-    // construct the HTTP header and send to the server
-    string httpHeader;
-    httpHeader.append("GET ").append(path).append(" HTTP/1.1\r\n")
-        .append("Host: ").append(host).append("\r\n")
-        .append("Connection: close\r\n")
-        .append("\r\n");
-    if (tcpSocket.write(httpHeader) != httpHeader.size()) {
-        cerr << "HTTP request failed.\n";
-        return;
-    }
+    string httpHeader = "GET " + path + " HTTP/1.1\r\n"
+                      + "Host: " + host + "\r\n"
+                      + "Connection: close\r\n"
+                      + "\r\n";
+    tcpSocket.write(httpHeader);
 
-    // read and print the output from the server until reaching “EOF”
-    while (!tcpSocket.eof()) {
-        cout << tcpSocket.read();
+    tcpSocket.shutdown(SHUT_WR);
+
+    string response;
+    while (true) {
+        string chunk = tcpSocket.read(1024);
+        if (chunk.empty()) {
+            break;  
+        }
+        response += chunk;
+        cout << chunk;  
     }
-    tcpSocket.close();  // close the TCP connection
 
     tcpSocket.wait_until_closed();
-    //    cerr << "Function called: get_URL(" << host << ", " << path << ").\n";
-    //    cerr << "Warning: get_URL() has not been implemented yet.\n";
 }
 
 int main(int argc, char *argv[]) {
