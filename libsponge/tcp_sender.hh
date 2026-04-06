@@ -32,6 +32,17 @@ class TCPSender {
     //! the (absolute) sequence number for the next byte to be sent
     uint64_t _next_seqno{0};
 
+    std::queue<TCPSegment> _segments_outstanding{}; // 未确认报文队列
+    size_t _window_size{1};                         // 接收窗口大小
+    unsigned _retransmission_timeout;               // 当前超时时间
+    unsigned _consec_retrans{0};                    // 连续重传次数
+    bool _fin_sent{false};                          // 是否已发送FIN
+    size_t _bytes_in_flight{0};                     // 发送中字节数
+    uint64_t _ackno{0};                             // 已确认的绝对序号
+
+    bool _timer_running{false};                     // 定时器是否正在运行 
+    size_t _timer{0};                               // 定时器计数器     
+
   public:
     //! Initialize a TCPSender
     TCPSender(const size_t capacity = TCPConfig::DEFAULT_CAPACITY,
