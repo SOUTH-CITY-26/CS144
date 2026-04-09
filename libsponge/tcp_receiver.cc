@@ -20,7 +20,7 @@ bool TCPReceiver::segment_received(const TCPSegment &seg) {
         }
         _syn_flag = true;                       // 标记已成功建立连接
         ret = true;                             // SYN 包有效
-        _isn = seg.header().seqno.raw_value();  // 记录 ISN
+        _isn = seg.header().seqno;              // 记录 ISN
         abs_seqno = 1;                          // SYN 占用序号 1
         _base = 1;                              // 下一个期望接收的绝对序号从 1 开始
         length = seg.length_in_sequence_space() - 1;    // 总长度减去 SYN 占用的 1 位
@@ -30,7 +30,7 @@ bool TCPReceiver::segment_received(const TCPSegment &seg) {
     } else if (!_syn_flag) {  // before get a SYN, refuse any segment
         return false;
     } else {  // not a SYN segment, compute it's abs_seqno
-        abs_seqno = unwrap(WrappingInt32(seg.header().seqno.raw_value()), WrappingInt32(_isn), _base);
+        abs_seqno = unwrap(WrappingInt32(seg.header().seqno.raw_value()), _isn, _base);
         length = seg.length_in_sequence_space();
     }
 
@@ -55,7 +55,7 @@ bool TCPReceiver::segment_received(const TCPSegment &seg) {
 
 optional<WrappingInt32> TCPReceiver::ackno() const {
     if (_base > 0)
-        return WrappingInt32(wrap(_base, WrappingInt32(_isn)));
+        return wrap(_base, _isn);
     else
         return std::nullopt;
 }

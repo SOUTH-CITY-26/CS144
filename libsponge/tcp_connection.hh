@@ -16,28 +16,16 @@ class TCPConnection {
     //! outbound queue of segments that the TCPConnection wants sent
     std::queue<TCPSegment> _segments_out{};
 
-    // elapsed time since last segment received
-    size_t _last_recv_et{0};
-
     //! Should the TCPConnection stay active (and keep ACKing)
     //! for 10 * _cfg.rt_timeout milliseconds after both streams have ended,
     //! in case the remote TCPConnection doesn't know we've received its whole stream?
     bool _linger_after_streams_finish{true};
 
-    // whether the connection is active
     bool _active{true};
+    size_t _time_since_last_segment_received{0};
 
-    // check the sender's out queue and send segments if it's not empty
-    void _clear_sendbuf();
-
-    // helper function to send an empty segment with RST flag
-    void _send_rst_segment();
-
-    // check whether prerequisites for shutting the connection is satisfied
-    bool _should_shutdown() const;
-
-    // shutdown the connection
-    void _shutdown(bool clean);
+    void set_rst_state(bool send_rst);
+    void attach_with_ack_and_win(); 
 
   public:
     //! \name "Input" interface for the writer

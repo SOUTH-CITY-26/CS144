@@ -1,8 +1,14 @@
-
 #include "tcp_connection.hh"
 
 #include <iostream>
-#include <limits>
+
+// Dummy implementation of a TCP connection
+
+// For Lab 4, please replace with a real implementation that passes the
+// automated checks run by `make check`.
+
+template <typename... Targs>
+void DUMMY_CODE(Targs &&... /* unused */) {}
 
 using namespace std;
 
@@ -12,144 +18,151 @@ size_t TCPConnection::bytes_in_flight() const { return _sender.bytes_in_flight()
 
 size_t TCPConnection::unassembled_bytes() const { return _receiver.unassembled_bytes(); }
 
-size_t TCPConnection::time_since_last_segment_received() const { return _last_recv_et; }
+size_t TCPConnection::time_since_last_segment_received() const { return _time_since_last_segment_received; }
 
 void TCPConnection::segment_received(const TCPSegment &seg) {
-    _last_recv_et = 0;
+    _time_since_last_segment_received = 0;
+    bool need_send_ack = seg.length_in_sequence_space() != 0;
 
-    const TCPHeader &header = seg.header();
-
+    auto &header = seg.header();
+    // 收到rst包, 则直接终止
     if (header.rst) {
-        _shutdown(false);
+        set_rst_state(false);
         return;
     }
-
+    // 接收数据
     _receiver.segment_received(seg);
 
+    // 收到ack包
     if (header.ack) {
         _sender.ack_received(header.ackno, header.win);
     }
 
-    // if the incoming segment occupys seqno and nothing has been sent,
-    // send at least one segment
-    if (seg.length_in_sequence_space() > 0 && _sender.segments_out().size() == 0) {
-        // in the case of listen SYN/ACK, fill_window() will send a segment
-        // with SYN=1 instead of 0
-        _sender.fill_window();
-
-        // if it's not the above case, send a plain empty segment
-        if (_sender.segments_out().size() == 0)
-            _sender.send_empty_segment();
+    // LISTEN -> SYN_RCVD
+    // SYN_RCVD -> SYN_SENT
+    if (TCPState::state_summary(_receiver) == TCPReceiverStateSummary::SYN_RECV &&
+        TCPState::state_summary(_sender) == TCPSenderStateSummary::CLOSED) {
+        // 发送SYN+ACK
+        connect();
+        return;
     }
 
-    // keep-alive response
-    if (_receiver.ackno().has_value() && (seg.length_in_sequence_space() == 0) &&
-        (header.seqno == _receiver.ackno().value() - 1)) {
-        _sender.send_empty_segment();
-    }
-    _clear_sendbuf();
-
-    if (_receiver.stream_out().input_ended() && !_sender.stream_in().input_ended()) {
+    // ESTABLISHED -> CLOSE_WAIT
+    if (TCPState::state_summary(_receiver) == TCPReceiverStateSummary::FIN_RECV &&
+        TCPState::state_summary(_sender) == TCPSenderStateSummary::SYN_ACKED) {
+        // 直接断开连接，不需要等待
         _linger_after_streams_finish = false;
     }
-}
 
-void TCPConnection::_clear_sendbuf() {
-    auto &sender_queue = _sender.segments_out();
-    while (!sender_queue.empty()) {
-        TCPSegment &seg = sender_queue.front();
-        TCPHeader &header = seg.header();
-        // header.win is of type uint16_t, while receiver's window size is size_t
-        // so we need to clamp it
-        uint16_t max_winsize = numeric_limits<uint16_t>::max();
-        if (_receiver.window_size() > max_winsize)
-            header.win = max_winsize;
-        else
-            header.win = _receiver.window_size();
-
-        if (_receiver.ackno().has_value()) {
-            header.ack = true;
-            header.ackno = _receiver.ackno().value();
-        }
-
-        _segments_out.push(seg);
-        sender_queue.pop();
+    // CLOSED
+    if (TCPState::state_summary(_receiver) == TCPReceiverStateSummary::FIN_RECV &&
+        TCPState::state_summary(_sender) == TCPSenderStateSummary::FIN_ACKED && !_linger_after_streams_finish) {
+        _active = false;
+        return;
     }
+
+    // 发送空的ack, keepalive
+    bool keepalive = (seg.length_in_sequence_space() == 0 && _receiver.ackno().has_value() &&
+                        _receiver.ackno().value() != header.seqno);
+    keepalive |= (header.ack && header.ackno - _sender.next_seqno() > 0);
+    if (!need_send_ack && keepalive) {
+        // 没有建立连接，不需要发送空的ack
+        if (TCPState::state_summary(_receiver) != TCPReceiverStateSummary::SYN_RECV ||
+            TCPState::state_summary(_sender) != TCPSenderStateSummary::SYN_ACKED) {
+        keepalive = false;
+        }
+    }
+    if (need_send_ack || keepalive) {
+        _sender.send_empty_segment();
+    }
+    // 给待发送的包添加 ack和win
+    attach_with_ack_and_win();
 }
 
 bool TCPConnection::active() const { return _active; }
 
 size_t TCPConnection::write(const string &data) {
-    size_t data_size = _sender.stream_in().write(data);
+    auto write_count = _sender.stream_in().write(data);
     _sender.fill_window();
-    _clear_sendbuf();
-    return data_size;
+    // 给待发送的包添加 ack和win
+    attach_with_ack_and_win();
+    return write_count;
 }
 
-//! \param[in] ms_since_last_tick number of milliseconds since the last call to this method
 void TCPConnection::tick(const size_t ms_since_last_tick) {
-    _last_recv_et += ms_since_last_tick;
-
-    if (_sender.consecutive_retransmissions() >= _cfg.MAX_RETX_ATTEMPTS) {
-        _send_rst_segment();
-        _shutdown(false);
+    _sender.tick(ms_since_last_tick);
+    if (_sender.consecutive_retransmissions() > _cfg.MAX_RETX_ATTEMPTS) {
+        // 重传次数过多
+        set_rst_state(true);
         return;
     }
+    // 给待发送的包添加 ack和win
+    attach_with_ack_and_win();
 
-    _sender.tick(ms_since_last_tick);
+    _time_since_last_segment_received += ms_since_last_tick;
 
-    if (_should_shutdown()) {
-        if (_linger_after_streams_finish) {
-            if (_last_recv_et >= 10 * _cfg.rt_timeout) {
-                _shutdown(true);
-            }
-        } else
-            _shutdown(true);
+    if (TCPState::state_summary(_receiver) == TCPReceiverStateSummary::FIN_RECV &&
+        TCPState::state_summary(_sender) == TCPSenderStateSummary::FIN_ACKED && _linger_after_streams_finish &&
+        _time_since_last_segment_received >= 10 * _cfg.rt_timeout) {
+        _active = false;
+        _linger_after_streams_finish = false;
     }
-    _clear_sendbuf();
-}
-
-bool TCPConnection::_should_shutdown() const {
-    return _receiver.stream_out().input_ended() && (_receiver.unassembled_bytes() == 0) &&
-           _sender.stream_in().input_ended() && (_sender.bytes_in_flight() == 0) &&
-           (_sender.next_seqno_absolute() == _sender.stream_in().bytes_written() + 2);
 }
 
 void TCPConnection::end_input_stream() {
     _sender.stream_in().end_input();
+    // 发送FIN
     _sender.fill_window();
-    _clear_sendbuf();
+    // 给待发送的包添加 ack和win
+    attach_with_ack_and_win();
 }
 
 void TCPConnection::connect() {
+    // 首次 fill_window 会发送SYN数据包
     _sender.fill_window();
-    _clear_sendbuf();
-}
-
-void TCPConnection::_send_rst_segment() {
-    _sender.send_empty_segment(false, false, true);
-    _clear_sendbuf();
-}
-
-void TCPConnection::_shutdown(bool clean) {
-    if (!clean) {
-        _sender.stream_in().set_error();
-        _receiver.stream_out().set_error();
-    }
-    _active = false;
+    _active = true;
+    // 给待发送的包添加 ack和win
+    attach_with_ack_and_win();
 }
 
 TCPConnection::~TCPConnection() {
     try {
         if (active()) {
-            cerr << "Warning: Unclean shutdown of TCPConnection\n";
-
-            // Your code here: need to send a RST segment to the peer
-            _send_rst_segment();
-            _shutdown(false);
-            _clear_sendbuf();
+        cerr << "Warning: Unclean shutdown of TCPConnection\n";
+        // RST
+        set_rst_state(false);
         }
     } catch (const exception &e) {
         std::cerr << "Exception destructing TCP FSM: " << e.what() << std::endl;
+    }
+}
+
+void TCPConnection::set_rst_state(bool send_rst) {
+    if (send_rst) {
+        TCPSegment seg;
+        seg.header().rst = true;
+        _segments_out.push(seg);
+    }
+    _receiver.stream_out().set_error();
+    _sender.stream_in().set_error();
+    // 直接关闭连接
+    _linger_after_streams_finish = false;
+    _active = false;
+}
+
+void TCPConnection::attach_with_ack_and_win() {
+    // 为数据包添加ack和win
+    while (!_sender.segments_out().empty()) {
+        auto &seg = _sender.segments_out().front();
+        auto &header = seg.header();
+        // 处于SYN_RECV之后的状态
+        if (_receiver.ackno().has_value()) {
+        header.ack = true;
+        // 添加 确认号+窗口大小
+        header.ackno = _receiver.ackno().value();
+        header.win = _receiver.window_size();
+        }
+        _segments_out.push(seg);
+        _sender.segments_out().pop();
     }
 }
